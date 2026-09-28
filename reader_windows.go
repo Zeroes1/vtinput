@@ -78,9 +78,16 @@ func (r *Reader) platformInit(in io.Reader) {
 }
 
 func (r *Reader) readBytes(buf []byte, timeout time.Duration) (int, error) {
+	if f, ok := r.in.(*os.File); ok && r.usesPump(f) {
+		return r.readPumpedBytes(buf, timeout, windows.Handle(f.Fd()))
+	}
+
 	if timeout > 0 {
+		// usesPump already put every file that cannot time a read out on the
+		// pump, so what is left here either has no deadline method at all or
+		// honours it.
 		if d, ok := r.in.(interface{ SetReadDeadline(time.Time) error }); ok {
-			d.SetReadDeadline(time.Now().Add(timeout))
+			_ = d.SetReadDeadline(time.Now().Add(timeout))
 			defer d.SetReadDeadline(time.Time{})
 		}
 	}
@@ -91,6 +98,127 @@ func (r *Reader) readBytes(buf []byte, timeout time.Duration) (int, error) {
 		}
 	}
 	return n, err
+}
+
+// usesPump reports whether this reader reads through the pump, deciding it
+// once for the life of the reader. A console handle never takes a deadline,
+// and a file that refuses one (an anonymous pipe) would block straight past
+// it — both need the pump, where the deadline is a timer.
+func (r *Reader) usesPump(f *os.File) bool {
+	r.readPathOnce.Do(func() {
+		if isConsoleHandle(f) {
+			r.pumpedRead = true
+			return
+		}
+		if err := f.SetReadDeadline(time.Now()); err != nil {
+			r.pumpedRead = true
+			return
+		}
+		_ = f.SetReadDeadline(time.Time{})
+	})
+	return r.pumpedRead
+}
+
+// isConsoleHandle reports whether f wraps a console handle.
+func isConsoleHandle(f *os.File) bool {
+	var mode uint32
+	return windows.GetConsoleMode(windows.Handle(f.Fd()), &mode) == nil
+}
+
+// readPumpedBytes waits for the next result of the pump goroutine and gives
+// up at the deadline. The pump owns the only read on the handle; this side
+// never blocks on it. A record that yields no bytes (a key-up, a resize)
+// never reaches this channel, so it cannot push the deadline out — which it
+// used to do: first by signalling a wait around the read, then by blocking
+// the read itself, so one ESC press waited for the next press and the two
+// merged into a single Double ESC event.
+func (r *Reader) readPumpedBytes(buf []byte, timeout time.Duration, handle windows.Handle) (int, error) {
+	if len(r.conpend) > 0 {
+		n := copy(buf, r.conpend)
+		r.conpend = r.conpend[n:]
+		if len(r.conpend) == 0 {
+			r.conpend = nil
+		}
+		return n, nil
+	}
+
+	select {
+	case <-r.done:
+		return 0, io.EOF
+	default:
+	}
+
+	if r.conreads == nil {
+		r.conreads = make(chan consoleRead, 1)
+		// Closing the reader cancels the pump's blocking read through this
+		// handle; without it the read would outlive the reader and pin the
+		// input buffer open.
+		if r.conHandle == 0 {
+			r.conHandle = uintptr(handle)
+		}
+		go r.conPump()
+	}
+
+	var timer <-chan time.Time
+	if timeout > 0 {
+		t := time.NewTimer(timeout)
+		defer t.Stop()
+		timer = t.C
+	}
+
+	select {
+	case <-r.done:
+		return 0, io.EOF
+	case <-timer:
+		return 0, nil
+	case res, ok := <-r.conreads:
+		if !ok {
+			if r.conErr != nil {
+				return 0, r.conErr
+			}
+			return 0, io.EOF
+		}
+		if res.n > 0 {
+			n := copy(buf, res.buf[:res.n])
+			if n < res.n {
+				// The caller's buffer was smaller than what one console
+				// read returned; the rest waits in conpend for the next
+				// call rather than being dropped.
+				r.conpend = append([]byte(nil), res.buf[n:res.n]...)
+			}
+			if r.MetricsEnabled {
+				r.lastReceivedAt = time.Now()
+			}
+			return n, res.err
+		}
+		return 0, res.err
+	}
+}
+
+// conPump owns the blocking read on the input handle. Results go over a
+// buffered channel so a read finishing between two readPumpedBytes calls
+// waits there instead of writing into a caller's buffer; a terminal error
+// closes the channel so later reads see it instead of waiting for a
+// goroutine that is gone.
+func (r *Reader) conPump() {
+	for {
+		b := make([]byte, 4096)
+		n, err := r.in.Read(b)
+		if n == 0 && err == nil {
+			// Nothing to hand out; the next read blocks for real input.
+			continue
+		}
+		select {
+		case r.conreads <- consoleRead{n: n, err: err, buf: b}:
+		case <-r.done:
+			return
+		}
+		if err != nil {
+			r.conErr = err
+			close(r.conreads)
+			return
+		}
+	}
 }
 
 func (r *Reader) readConPTYEventTimeout(timeout time.Duration) (*InputEvent, error) {

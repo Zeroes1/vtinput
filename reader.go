@@ -18,13 +18,21 @@ type plan9Read struct {
 	buf []byte
 }
 
+// consoleRead carries one completed read from the Windows console pump
+// goroutine, for the same reason plan9Read exists for Plan 9.
+type consoleRead struct {
+	n   int
+	err error
+	buf []byte
+}
+
 type Reader struct {
 	in                     io.Reader
 	buf                    []byte
 	done                   chan struct{}
 	useConPTY              bool // Windows only
 	far2lExtensionsEnabled bool
-	conHandle              uintptr // Windows only: console handle
+	conHandle              uintptr // Windows only: input handle (native console path, pump otherwise)
 	cancelEvent            uintptr // Windows only: event handle for cancellation
 	oldMode                uint32  // Windows only: saved console mode
 	stopPipe               [2]int  // Unix only: pipe for interrupting Poll
@@ -34,6 +42,22 @@ type Reader struct {
 	p9reads chan plan9Read
 	p9stop  chan struct{}
 	p9once  sync.Once
+
+	// Windows only: a console input buffer, and a file that refuses a
+	// deadline (an anonymous pipe), are not pollable — a read on them either
+	// never ends or swallows any deadline arranged from the outside: a record
+	// that yields no bytes (a key-up) signals the handle, the read starts,
+	// and only the next byte-producing record ends it. So those inputs get
+	// the same shape as Plan 9: one goroutine owns the read and reports over
+	// a channel, and the deadline is the select on that channel.
+	conreads chan consoleRead
+	conpend  []byte // bytes read by the pump but not handed out yet
+	conErr   error  // terminal pump error, returned once conreads is closed
+
+	// Windows only: whether this reader pumps is a property of its input and
+	// is decided once, on the first read.
+	readPathOnce sync.Once
+	pumpedRead   bool
 
 	mu             sync.Mutex
 	lastLatency    time.Duration
