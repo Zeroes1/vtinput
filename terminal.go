@@ -3,10 +3,38 @@ package vtinput
 import (
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"golang.org/x/term"
 )
+
+// homeState is the console input mode MakeRaw saw before the last
+// EnableProtocols call -- the mode the shell left behind, with
+// ENABLE_VIRTUAL_TERMINAL_INPUT off. Both the restore closure returned to the
+// caller and Reader.platformClose must hand the console back in this state:
+// the mode snapshot the reader takes at its own creation is the raw mode
+// MakeRaw just built, and restoring *that* on close leaves VT input enabled,
+// which makes the console host deliver the terminal's mouse reports to the
+// next reader as key events instead of mouse events.
+var (
+	homeMu    sync.Mutex
+	homeState *term.State
+)
+
+func setHomeState(s *term.State) {
+	homeMu.Lock()
+	homeState = s
+	homeMu.Unlock()
+}
+
+// homeTerminalState returns the last state MakeRaw was called with, or nil if
+// EnableProtocols has not run in this process.
+func homeTerminalState() *term.State {
+	homeMu.Lock()
+	defer homeMu.Unlock()
+	return homeState
+}
 
 // Win32 Input Mode & Kitty Protocol sequences
 const (
@@ -64,6 +92,7 @@ func EnableProtocols(p Protocol) (func(), error) {
 	if err != nil {
 		return nil, err
 	}
+	setHomeState(oldState)
 
 	// 3. Build activation and deactivation strings
 	var enableSeq, disableSeq string
