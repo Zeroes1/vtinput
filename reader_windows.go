@@ -11,6 +11,7 @@ import (
 	"unsafe"
 
 	"golang.org/x/sys/windows"
+	"golang.org/x/term"
 )
 
 var procReadConsoleInputW = windows.NewLazySystemDLL("kernel32.dll").NewProc("ReadConsoleInputW")
@@ -337,7 +338,17 @@ func (r *Reader) platformClose() {
 	}
 	if r.conHandle != 0 {
 		windows.CancelIoEx(windows.Handle(r.conHandle), nil)
-		if r.oldMode != 0 {
+		// Hand back the mode MakeRaw saw before anything of ours touched the
+		// console, not r.oldMode: that snapshot was taken at reader creation,
+		// i.e. after term.MakeRaw had already set ENABLE_VIRTUAL_TERMINAL_INPUT,
+		// and leaving it in place after exit makes the console host parse the
+		// terminal's mouse reports as VT sequences and feed them to the shell
+		// as key events -- mouse coordinates echoed at the prompt.
+		if s := homeTerminalState(); s != nil {
+			if err := term.Restore(int(r.conHandle), s); err != nil {
+				Log("Reader: restoring terminal home state failed: %v", err)
+			}
+		} else if r.oldMode != 0 {
 			windows.SetConsoleMode(windows.Handle(r.conHandle), r.oldMode)
 		}
 	}
